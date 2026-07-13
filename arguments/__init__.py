@@ -85,6 +85,11 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.lambda_dist = 0.0
         self.lambda_normal = 0.05
+        self.lambda_fovea = 0.0
+        self.gaze_x = 0.5
+        self.gaze_y = 0.5
+        self.fovea_start_iter = 3000
+        self.fovea_only = False
         self.opacity_cull = 0.05
 
         self.densification_interval = 100

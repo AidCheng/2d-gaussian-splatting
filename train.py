@@ -13,6 +13,8 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+import torch.nn.functional as F
+from odak.learn.perception import MetamerMSELoss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -41,6 +43,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    use_fovea = opt.lambda_fovea > 0 or opt.fovea_only
+    fovea_loss_fn = MetamerMSELoss().to("cuda") if use_fovea else None
+
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -48,6 +53,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
+    ema_fovea_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -72,7 +78,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        
+
+        # foveated loss (steerable pyramid needs dims divisible by 64)
+        fovea_loss = torch.tensor(0.0, device="cuda")
+        if fovea_loss_fn is not None and iteration > opt.fovea_start_iter:
+            h = (image.shape[1] // 64) * 64
+            w = (image.shape[2] // 64) * 64
+            img_f = F.interpolate(image.unsqueeze(0), (h, w), mode="bilinear", align_corners=False)
+            gt_f = F.interpolate(gt_image.unsqueeze(0), (h, w), mode="bilinear", align_corners=False)
+            fovea_raw = fovea_loss_fn(img_f, gt_f, gaze=[opt.gaze_x, opt.gaze_y])
+            fovea_loss = (1.0 if opt.fovea_only else opt.lambda_fovea) * fovea_raw
+            if opt.fovea_only:
+                loss = torch.tensor(0.0, device="cuda")
+
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
@@ -85,7 +103,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dist_loss = lambda_dist * (rend_dist).mean()
 
         # loss
-        total_loss = loss + dist_loss + normal_loss
+        total_loss = loss + dist_loss + normal_loss + fovea_loss
         
         total_loss.backward()
 
@@ -96,6 +114,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
             ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
+            ema_fovea_for_log = 0.4 * fovea_loss.item() + 0.6 * ema_fovea_for_log
 
 
             if iteration % 10 == 0:
@@ -103,6 +122,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "distort": f"{ema_dist_for_log:.{5}f}",
                     "normal": f"{ema_normal_for_log:.{5}f}",
+                    "fovea": f"{ema_fovea_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
                 progress_bar.set_postfix(loss_dict)
